@@ -52,8 +52,13 @@ def _registry_row(canonical_id: str, canonical_name: str, aliases=None) -> dict:
 
 
 def test_fuzzy_match_finds_close_typo():
+    # "Qdrat" (one letter dropped) scores ~91 via rapidfuzz token_sort_ratio
+    # — above FUZZY_MATCH_THRESHOLD=88. A transposition typo like "Qdrnat"
+    # only scores ~83 and was previously (incorrectly) asserted to match —
+    # this test never actually ran until pytest was added to the compiler
+    # image (session 9), so the wrong expectation went unnoticed.
     registry = [_registry_row("ent_1", "Qdrant")]
-    result = resolver._find_via_fuzzy("Qdrnat", registry)
+    result = resolver._find_via_fuzzy("Qdrat", registry)
     assert result == "ent_1"
 
 

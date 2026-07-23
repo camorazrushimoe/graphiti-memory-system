@@ -1,0 +1,12 @@
+# Dev-only dependencies — not needed to run the compiler service itself,
+# only to run its unit tests (services/compiler/pipeline/test_*.py).
+# Kept separate from requirements.txt so the distinction between "runtime"
+# and "dev/test" deps is explicit rather than implicit-by-comment.
+#
+# Installed by services/compiler/Dockerfile as a second, separate layer —
+# this is a small personal-scale project (single compiler image, no
+# multi-stage prod/dev split), so the simplicity of "tests always runnable
+# inside the running container" wins over shaving a few MB off the image.
+# Revisit with a multi-stage Dockerfile if image size/attack-surface ever
+# becomes a real concern.
+pytest==9.1.1
