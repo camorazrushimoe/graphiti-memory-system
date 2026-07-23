@@ -14,6 +14,8 @@ the LM Studio / cross-encoder workarounds in two places.
 from __future__ import annotations
 
 import os
+from typing import Any
+from pydantic import BaseModel
 
 from graphiti_core import Graphiti
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
@@ -40,6 +42,21 @@ NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "changeme")
 _graphiti: Graphiti | None = None
 
 
+class LMStudioOpenAIGenericClient(OpenAIGenericClient):
+    """Custom client that overrides _build_response_format to be fully compatible with LM Studio.
+
+    If response_model is None, we return {"type": "text"} instead of {"type": "json_object"},
+    as LM Studio's llama.cpp backend rejects json_object requests with 400.
+    """
+
+    def _build_response_format(
+        self, response_model: type[BaseModel] | None
+    ) -> dict[str, Any]:
+        if response_model is None:
+            return {"type": "text"}
+        return super()._build_response_format(response_model)
+
+
 def get_graphiti() -> Graphiti:
     """Lazily create and cache the Graphiti client.
 
@@ -48,7 +65,7 @@ def get_graphiti() -> Graphiti:
     """
     global _graphiti
     if _graphiti is None:
-        llm_client = OpenAIGenericClient(
+        llm_client = LMStudioOpenAIGenericClient(
             config=LLMConfig(
                 api_key="lm-studio",  # LM Studio ignores the key, field is required
                 model=LLM_MODEL,

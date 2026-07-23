@@ -77,3 +77,21 @@ def test_normalize_session_dict_roundtrip():
     assert len(normalized.turns) == 2
     assert normalized.turns[0].message_id == "u1"
     assert normalized.turns[1].role == "assistant"
+
+
+def test_normalize_turn_truncates_long_tool_call_result():
+    raw = RawTurn(
+        role="assistant",
+        content="Reading file",
+        timestamp="2026-07-22T10:00:00Z",
+        message_id="a1",
+        tool_calls=[
+            ToolCall(name="read_file", arguments={"path": "."}, result="A" * 1500)
+        ],
+    )
+    turn = normalizer.normalize_turn(
+        raw, session_id="sess_1", source_agent="claude_cli"
+    )
+    assert "[tool_call:read_file]" in turn.content
+    assert "truncated" in turn.content
+    assert len(turn.content) < 1500

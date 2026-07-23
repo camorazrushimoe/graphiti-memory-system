@@ -457,31 +457,43 @@ async def process_job(job: dict) -> None:
     await db.complete_job(job_id)
 
 
-async def worker_loop() -> None:
-    configure_dspy()
-    logger.info("compiler worker started, polling every %.1fs", POLL_INTERVAL_SECONDS)
+async def heartbeat_sender() -> None:
+    """Background task to touch the worker heartbeat periodically.
 
+    Runs independently of the main worker loop, so a long-running LLM job
+    doesn't cause the heartbeat to expire on the dashboard while the worker
+    is legitimately busy.
+    """
     while True:
-        # Dashboard support (see schema/init.sql's `worker_heartbeat` table
-        # docstring): touched on every poll tick, whether or not there was
-        # a job to claim, so `services/ingest`'s `/metrics` can tell a
-        # live-but-idle worker apart from a hung/crashed one (a hang would
-        # freeze this loop, so `last_seen` stops advancing).
         try:
             await db.touch_worker_heartbeat("compiler")
         except Exception:  # noqa: BLE001 — heartbeat is best-effort, never fatal
             logger.exception("failed to write compiler heartbeat (non-fatal)")
+        await asyncio.sleep(5.0)  # touch every 5s, well within 15s staleness threshold
 
-        job = await db.claim_next_job()
-        if job is None:
-            await asyncio.sleep(POLL_INTERVAL_SECONDS)
-            continue
 
-        try:
-            await process_job(job)
-        except Exception as exc:  # noqa: BLE001 — worker must never crash the loop
-            logger.exception("job %s failed", job["job_id"])
-            await db.fail_job(job["job_id"], job["attempts"] + 1, str(exc))
+async def worker_loop() -> None:
+    configure_dspy()
+    logger.info("compiler worker started, polling every %.1fs", POLL_INTERVAL_SECONDS)
+
+    # Start the background heartbeat sender task
+    heartbeat_task = asyncio.create_task(heartbeat_sender())
+
+    try:
+        while True:
+            job = await db.claim_next_job()
+            if job is None:
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                continue
+
+            try:
+                await process_job(job)
+            except Exception as exc:  # noqa: BLE001 — worker must never crash the loop
+                logger.exception("job %s failed", job["job_id"])
+                await db.fail_job(job["job_id"], job["attempts"] + 1, str(exc))
+    finally:
+        # Clean up the background task when exiting
+        heartbeat_task.cancel()
 
 
 async def main() -> None:

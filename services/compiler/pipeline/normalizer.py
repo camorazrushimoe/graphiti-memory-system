@@ -89,7 +89,15 @@ def _strip_tool_call_binary(turn: RawTurn) -> str:
             result_text = tc.result if isinstance(tc.result, str) else None
             summary = f"[tool_call:{tc.name}]"
             if result_text:
-                summary += f" -> {result_text}"
+                max_len = 1000
+                if len(result_text) > max_len:
+                    truncated_text = (
+                        result_text[:max_len]
+                        + f"\n... [truncated {len(result_text) - max_len} chars]"
+                    )
+                else:
+                    truncated_text = result_text
+                summary += f" -> {truncated_text}"
             tool_summaries.append(summary)
         if tool_summaries:
             content = (

@@ -14,7 +14,7 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "gemma-4-e4b-it")
 _configured = False
 
 
-def configure_dspy(max_tokens: int = 2048, timeout: float = 30.0) -> dspy.LM:
+def configure_dspy(max_tokens: int = 2048, timeout: float = 300.0) -> dspy.LM:
     """Configure DSPy's global LM to use Gemma 4B via LM Studio.
 
     Idempotent — safe to call multiple times (e.g. once per module import).
