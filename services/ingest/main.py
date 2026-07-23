@@ -9,6 +9,8 @@ Endpoints:
   POST /ingest        - full session dump (fallback / replay)
   POST /retrieve      - Layer 7: semantic + graph + temporal memory_packet
   GET  /healthz       - liveness check
+  GET  /metrics       - dashboard JSON snapshot (all stores + LM Studio + compiler)
+  GET  /dashboard      - dashboard HTML page (polls /metrics)
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import sys
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 
 sys.path.insert(
     0, str(Path(__file__).resolve().parents[2])
@@ -33,17 +36,33 @@ from schema.turn import (  # noqa: E402
 from common import archive, db  # noqa: E402
 from common.graphiti_config import close_graphiti  # noqa: E402
 from common.qdrant_client import close_qdrant  # noqa: E402
-from services.ingest import retrieval  # noqa: E402
+from services.ingest import dashboard_metrics, retrieval  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ingest")
 
 app = FastAPI(title="Graphiti Memory — Ingest Service")
 
+_DASHBOARD_HTML = (Path(__file__).parent / "dashboard.html").read_text()
+
 
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+
+@app.get("/metrics")
+async def metrics():
+    """Dashboard data source — see `dashboard_metrics.collect_metrics` for
+    what each section means. Snapshot-only, no history stored server-side;
+    the dashboard page polls this repeatedly to approximate "live".
+    """
+    return await dashboard_metrics.collect_metrics()
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    return _DASHBOARD_HTML
 
 
 @app.post("/ingest/turn")

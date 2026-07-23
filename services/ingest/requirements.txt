@@ -11,3 +11,7 @@ python-dateutil==2.9.0.post0
 openai==2.47.0
 graphiti-core==0.29.2
 qdrant-client==1.18.0
+
+# Dashboard (/metrics, /dashboard): LM Studio reachability check does a
+# plain HTTP GET, independent of the openai SDK client used elsewhere.
+httpx==0.27.2

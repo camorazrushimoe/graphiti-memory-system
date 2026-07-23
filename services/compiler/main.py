@@ -462,6 +462,16 @@ async def worker_loop() -> None:
     logger.info("compiler worker started, polling every %.1fs", POLL_INTERVAL_SECONDS)
 
     while True:
+        # Dashboard support (see schema/init.sql's `worker_heartbeat` table
+        # docstring): touched on every poll tick, whether or not there was
+        # a job to claim, so `services/ingest`'s `/metrics` can tell a
+        # live-but-idle worker apart from a hung/crashed one (a hang would
+        # freeze this loop, so `last_seen` stops advancing).
+        try:
+            await db.touch_worker_heartbeat("compiler")
+        except Exception:  # noqa: BLE001 — heartbeat is best-effort, never fatal
+            logger.exception("failed to write compiler heartbeat (non-fatal)")
+
         job = await db.claim_next_job()
         if job is None:
             await asyncio.sleep(POLL_INTERVAL_SECONDS)

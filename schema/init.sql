@@ -78,3 +78,18 @@ CREATE TABLE IF NOT EXISTS review_queue (
 );
 
 CREATE INDEX IF NOT EXISTS idx_review_queue_status ON review_queue(status);
+
+-- Dashboard support: compiler worker heartbeat. The compiler has no HTTP
+-- port of its own (per docker-compose services table — only `ingest` is
+-- exposed), so this is the only reliable signal that the worker *loop* is
+-- actually alive and cycling, as opposed to the container merely being in
+-- a "running" Docker state (a hung/deadlocked process would still show as
+-- "running" in `docker compose ps`). `worker_loop()` upserts its own row
+-- on every poll iteration (every POLL_INTERVAL_SECONDS, ~2s) whether or
+-- not there was a job to process — the dashboard (`services/ingest`
+-- `/metrics`) flags the compiler as down if `last_seen` is older than a
+-- few poll intervals.
+CREATE TABLE IF NOT EXISTS worker_heartbeat (
+    worker_name TEXT PRIMARY KEY,
+    last_seen   TIMESTAMPTZ NOT NULL
+);

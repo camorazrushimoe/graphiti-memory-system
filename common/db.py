@@ -490,3 +490,110 @@ async def resolve_review(review_id: int, status: str) -> Optional[dict]:
             status,
         )
         return dict(row) if row else None
+
+
+# --- Worker heartbeat (dashboard support) -----------------------------------
+
+
+async def touch_worker_heartbeat(worker_name: str) -> None:
+    """Upsert `last_seen = now()` for a named worker. Called by the
+    compiler's `worker_loop()` on every poll tick (see `schema/init.sql`'s
+    `worker_heartbeat` table docstring).
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO worker_heartbeat (worker_name, last_seen)
+            VALUES ($1, now())
+            ON CONFLICT (worker_name) DO UPDATE SET last_seen = now()
+            """,
+            worker_name,
+        )
+
+
+async def get_worker_heartbeat(worker_name: str) -> Optional[dict]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT worker_name, last_seen FROM worker_heartbeat WHERE worker_name = $1",
+            worker_name,
+        )
+        return dict(row) if row else None
+
+
+# --- Dashboard metrics -------------------------------------------------------
+
+
+async def get_dashboard_metrics() -> dict:
+    """Single round-trip (a handful of cheap aggregate queries in one
+    connection) gathering everything the dashboard's `/metrics` endpoint
+    needs from Postgres. Kept as one function (rather than many small ones
+    called separately) so the dashboard's Postgres section is always a
+    consistent snapshot from roughly the same instant, and so adding a new
+    metric later means touching one query list instead of hunting for
+    where to slot in a new round-trip.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        sessions_total = await conn.fetchval("SELECT count(*) FROM sessions")
+        sessions_24h = await conn.fetchval(
+            "SELECT count(*) FROM sessions WHERE ingested_at > now() - interval '24 hours'"
+        )
+        facts_by_status = await conn.fetch(
+            "SELECT status, count(*) AS n FROM facts GROUP BY status"
+        )
+        facts_by_type = await conn.fetch(
+            "SELECT type, count(*) AS n FROM facts WHERE status = 'active' GROUP BY type"
+        )
+        entities_total = await conn.fetchval("SELECT count(*) FROM entities")
+        jobs_by_status = await conn.fetch(
+            "SELECT status, count(*) AS n FROM compiler_jobs GROUP BY status"
+        )
+        oldest_queued_age_seconds = await conn.fetchval(
+            """
+            SELECT EXTRACT(EPOCH FROM (now() - min(created_at)))
+            FROM compiler_jobs WHERE status = 'queued'
+            """
+        )
+        jobs_errored_1h = await conn.fetchval(
+            """
+            SELECT count(*) FROM compiler_jobs
+            WHERE status = 'error' AND updated_at > now() - interval '1 hour'
+            """
+        )
+        last_fact_created_at = await conn.fetchval("SELECT max(created_at) FROM facts")
+        review_pending = await conn.fetchval(
+            "SELECT count(*) FROM review_queue WHERE status = 'pending'"
+        )
+        contradictions_1h = await conn.fetchval(
+            "SELECT count(*) FROM review_queue WHERE created_at > now() - interval '1 hour'"
+        )
+        auto_updates_1h = await conn.fetchval(
+            """
+            SELECT count(*) FROM facts
+            WHERE status = 'outdated' AND created_at > now() - interval '1 hour'
+                AND superseded_by IS NOT NULL
+            """
+        )
+        compiler_heartbeat = await conn.fetchrow(
+            "SELECT last_seen FROM worker_heartbeat WHERE worker_name = 'compiler'"
+        )
+
+    return {
+        "sessions_total": sessions_total,
+        "sessions_24h": sessions_24h,
+        "facts_by_status": {r["status"]: r["n"] for r in facts_by_status},
+        "facts_by_type": {r["type"]: r["n"] for r in facts_by_type},
+        "entities_total": entities_total,
+        "jobs_by_status": {r["status"]: r["n"] for r in jobs_by_status},
+        "oldest_queued_job_age_seconds": oldest_queued_age_seconds,
+        "jobs_errored_1h": jobs_errored_1h,
+        "last_fact_created_at": last_fact_created_at,
+        "review_pending": review_pending,
+        "contradictions_1h": contradictions_1h,
+        "auto_updates_1h": auto_updates_1h,
+        "compiler_last_heartbeat": compiler_heartbeat["last_seen"]
+        if compiler_heartbeat
+        else None,
+    }

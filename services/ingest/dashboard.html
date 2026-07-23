@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Graphiti Memory System — Dashboard</title>
+<meta http-equiv="refresh" content="" />
+<style>
+  :root {
+    --bg: #0f1115;
+    --card: #171a21;
+    --border: #2a2e38;
+    --text: #e6e8eb;
+    --muted: #8b93a1;
+    --green: #3fb950;
+    --red: #f85149;
+    --yellow: #d29922;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    padding: 24px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .banner {
+    padding: 10px 16px;
+    border-radius: 8px;
+    font-weight: 600;
+    margin-bottom: 20px;
+    font-size: 14px;
+  }
+  .banner.ok { background: #123320; color: var(--green); border: 1px solid #1e4d2c; }
+  .banner.bad { background: #3a1414; color: var(--red); border: 1px solid #5c1f1f; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .card-title {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+  }
+  .dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    display: inline-block;
+  }
+  .dot.up { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot.down { background: var(--red); box-shadow: 0 0 6px var(--red); }
+  .big { font-size: 26px; font-weight: 700; }
+  .row { display: flex; justify-content: space-between; font-size: 13px; padding: 3px 0; color: var(--muted); }
+  .row b { color: var(--text); font-weight: 600; }
+  section { margin-bottom: 28px; }
+  section > h2 {
+    font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--muted); border-bottom: 1px solid var(--border);
+    padding-bottom: 6px; margin-bottom: 12px;
+  }
+  .warn-text { color: var(--yellow); }
+  .err-text { color: var(--red); }
+  .muted { color: var(--muted); }
+  #err { color: var(--red); font-size: 13px; margin-bottom: 12px; }
+  footer { color: var(--muted); font-size: 12px; margin-top: 30px; }
+  code { background: #1c2028; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<h1>Graphiti Memory System</h1>
+<div class="subtitle">Live status snapshot · refreshes every <span id="interval-label">5</span>s · <span id="ts">—</span></div>
+
+<div id="err"></div>
+<div id="banner" class="banner ok">Loading…</div>
+
+<section>
+  <h2>Services</h2>
+  <div class="grid" id="services-grid"></div>
+</section>
+
+<section>
+  <h2>Throughput &amp; Memory Growth</h2>
+  <div class="grid" id="throughput-grid"></div>
+</section>
+
+<section>
+  <h2>Compiler Queue</h2>
+  <div class="grid" id="queue-grid"></div>
+</section>
+
+<section>
+  <h2>Memory Quality</h2>
+  <div class="grid" id="quality-grid"></div>
+</section>
+
+<section>
+  <h2>Storage Sizes</h2>
+  <div class="grid" id="storage-grid"></div>
+</section>
+
+<footer>
+  Endpoint: <code>GET /metrics</code> · Ingest service · Graphiti Memory System
+</footer>
+
+<script>
+const POLL_MS = 5000;
+document.getElementById('interval-label').textContent = (POLL_MS / 1000).toFixed(0);
+
+function fmtAge(seconds) {
+  if (seconds === null || seconds === undefined) return "never";
+  if (seconds < 60) return Math.round(seconds) + "s ago";
+  if (seconds < 3600) return Math.round(seconds / 60) + "m ago";
+  if (seconds < 86400) return Math.round(seconds / 3600) + "h ago";
+  return Math.round(seconds / 86400) + "d ago";
+}
+
+function card(title, bodyHtml, extraHeaderHtml) {
+  const el = document.createElement('div');
+  el.className = 'card';
+  el.innerHTML = `<div class="card-title"><span>${title}</span>${extraHeaderHtml || ''}</div>${bodyHtml}`;
+  return el;
+}
+
+function dot(up) {
+  return `<span class="dot ${up ? 'up' : 'down'}"></span>`;
+}
+
+function renderServices(services) {
+  const grid = document.getElementById('services-grid');
+  grid.innerHTML = '';
+  const labels = {
+    ingest: 'Ingest (this service)',
+    compiler: 'Compiler worker',
+    postgres: 'Postgres',
+    neo4j: 'Neo4j (Graphiti)',
+    qdrant: 'Qdrant',
+    lm_studio: 'LM Studio (host)',
+  };
+  for (const [key, label] of Object.entries(labels)) {
+    const up = !!services[key];
+    grid.appendChild(card(label, `<div class="big">${up ? 'UP' : 'DOWN'}</div>`, dot(up)));
+  }
+}
+
+function renderThroughput(m) {
+  const grid = document.getElementById('throughput-grid');
+  grid.innerHTML = '';
+  const pg = m.postgres;
+  if (!pg.ok) { grid.appendChild(card('Postgres', '<div class="err-text">unreachable</div>')); return; }
+
+  grid.appendChild(card('Sessions', `
+    <div class="big">${pg.sessions_total}</div>
+    <div class="row"><span>last 24h</span><b>${pg.sessions_24h}</b></div>
+  `));
+
+  const factsByStatus = pg.facts_by_status || {};
+  const totalFacts = Object.values(factsByStatus).reduce((a, b) => a + b, 0);
+  grid.appendChild(card('Facts', `
+    <div class="big">${totalFacts}</div>
+    <div class="row"><span>active</span><b>${factsByStatus.active || 0}</b></div>
+    <div class="row"><span>outdated</span><b>${factsByStatus.outdated || 0}</b></div>
+    <div class="row"><span>discarded</span><b>${factsByStatus.discarded || 0}</b></div>
+  `));
+
+  grid.appendChild(card('Entities in registry', `<div class="big">${pg.entities_total}</div>`));
+
+  const staleness = pg.last_fact_age_seconds;
+  const staleClass = staleness === null ? 'muted' : (staleness > 3600 ? 'warn-text' : '');
+  grid.appendChild(card('Last fact written', `
+    <div class="big ${staleClass}">${fmtAge(staleness)}</div>
+    <div class="row"><span>i.e. is memory still growing</span></div>
+  `));
+}
+
+function renderQueue(m) {
+  const grid = document.getElementById('queue-grid');
+  grid.innerHTML = '';
+  const pg = m.postgres;
+  if (!pg.ok) { grid.appendChild(card('Compiler jobs', '<div class="err-text">unreachable</div>')); return; }
+
+  const jobs = pg.jobs_by_status || {};
+  grid.appendChild(card('Jobs by status', `
+    <div class="row"><span>queued</span><b>${jobs.queued || 0}</b></div>
+    <div class="row"><span>running</span><b>${jobs.running || 0}</b></div>
+    <div class="row"><span>done</span><b>${jobs.done || 0}</b></div>
+    <div class="row"><span>error</span><b class="${(jobs.error || 0) > 0 ? 'err-text' : ''}">${jobs.error || 0}</b></div>
+  `));
+
+  const oldest = pg.oldest_queued_job_age_seconds;
+  const backlogClass = oldest && oldest > 120 ? 'warn-text' : '';
+  grid.appendChild(card('Oldest queued job', `
+    <div class="big ${backlogClass}">${oldest ? fmtAge(oldest) : 'none queued'}</div>
+  `));
+
+  grid.appendChild(card('Errored jobs (1h)', `
+    <div class="big ${(pg.jobs_errored_1h || 0) > 0 ? 'err-text' : ''}">${pg.jobs_errored_1h || 0}</div>
+  `));
+
+  const hbAge = pg.compiler_heartbeat_age_seconds;
+  const hbClass = pg.compiler_alive ? '' : 'err-text';
+  grid.appendChild(card('Compiler heartbeat', `
+    <div class="big ${hbClass}">${fmtAge(hbAge)}</div>
+  `));
+}
+
+function renderQuality(m) {
+  const grid = document.getElementById('quality-grid');
+  grid.innerHTML = '';
+  const pg = m.postgres;
+  if (!pg.ok) { grid.appendChild(card('Quality signals', '<div class="err-text">unreachable</div>')); return; }
+
+  grid.appendChild(card('Auto-updates (1h)', `
+    <div class="big">${pg.auto_updates_1h || 0}</div>
+    <div class="row"><span>contradiction score &gt; 0.85</span></div>
+  `));
+
+  grid.appendChild(card('Pending review', `
+    <div class="big ${(pg.review_pending || 0) > 0 ? 'warn-text' : ''}">${pg.review_pending || 0}</div>
+    <div class="row"><span>score 0.6–0.85, needs a look</span></div>
+  `));
+
+  grid.appendChild(card('Contradictions (1h)', `<div class="big">${pg.contradictions_1h || 0}</div>`));
+
+  const byType = pg.facts_by_type || {};
+  const typeRows = Object.entries(byType).map(([t, n]) => `<div class="row"><span>${t}</span><b>${n}</b></div>`).join('');
+  grid.appendChild(card('Active facts by type', typeRows || '<div class="muted">none yet</div>'));
+}
+
+function renderStorage(m) {
+  const grid = document.getElementById('storage-grid');
+  grid.innerHTML = '';
+
+  const n4j = m.neo4j;
+  if (n4j.ok) {
+    grid.appendChild(card('Neo4j graph', `
+      <div class="row"><span>Entity nodes</span><b>${n4j.entity_nodes}</b></div>
+      <div class="row"><span>Episodic nodes</span><b>${n4j.episodic_nodes}</b></div>
+      <div class="row"><span>RELATES_TO edges</span><b>${n4j.relates_to_edges}</b></div>
+      <div class="row"><span>SUPERSEDES edges</span><b>${n4j.supersedes_edges}</b></div>
+    `));
+  } else {
+    grid.appendChild(card('Neo4j graph', '<div class="err-text">unreachable</div>'));
+  }
+
+  const q = m.qdrant;
+  if (q.ok) {
+    const cols = q.collections || {};
+    const rows = Object.entries(cols).map(([name, count]) => `<div class="row"><span>${name}</span><b>${count}</b></div>`).join('');
+    grid.appendChild(card('Qdrant collections', rows));
+  } else {
+    grid.appendChild(card('Qdrant collections', '<div class="err-text">unreachable</div>'));
+  }
+
+  const lm = m.lm_studio;
+  if (lm.ok) {
+    grid.appendChild(card('LM Studio models loaded', `
+      <div>${(lm.models_loaded || []).map(id => `<div class="row"><span>${id}</span></div>`).join('') || '<div class="muted">none</div>'}</div>
+    `));
+  } else {
+    grid.appendChild(card('LM Studio', `<div class="err-text">${lm.error || 'unreachable'}</div>`));
+  }
+}
+
+async function refresh() {
+  try {
+    const resp = await fetch('/metrics', { cache: 'no-store' });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const m = await resp.json();
+
+    document.getElementById('err').textContent = '';
+    document.getElementById('ts').textContent = new Date(m.generated_at).toLocaleTimeString();
+
+    const banner = document.getElementById('banner');
+    if (m.all_healthy) {
+      banner.className = 'banner ok';
+      banner.textContent = 'All systems operational';
+    } else {
+      banner.className = 'banner bad';
+      const down = Object.entries(m.services).filter(([, up]) => !up).map(([name]) => name);
+      banner.textContent = 'Degraded — down: ' + down.join(', ');
+    }
+
+    renderServices(m.services);
+    renderThroughput(m);
+    renderQueue(m);
+    renderQuality(m);
+    renderStorage(m);
+  } catch (e) {
+    document.getElementById('err').textContent = 'Failed to reach /metrics: ' + e.message;
+    document.getElementById('banner').className = 'banner bad';
+    document.getElementById('banner').textContent = 'Dashboard cannot reach the ingest service';
+  }
+}
+
+refresh();
+setInterval(refresh, POLL_MS);
+</script>
+</body>
+</html>
