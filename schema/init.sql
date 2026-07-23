@@ -93,3 +93,24 @@ CREATE TABLE IF NOT EXISTS worker_heartbeat (
     worker_name TEXT PRIMARY KEY,
     last_seen   TIMESTAMPTZ NOT NULL
 );
+
+-- Agent integration dashboard support ("Connected Agents" section). One row
+-- per `source_agent` value ever seen (see agent-integration.md, decision
+-- #3): the `ingest` service upserts this row on every `/ingest/turn`
+-- (action='write') and `/retrieve` (action='read') request, using the
+-- `source_agent` string already carried in those request bodies — no
+-- plugin-side changes needed to produce this data, the server already
+-- knows who's calling. `read_tokens_estimate_total` approximates how many
+-- tokens a paid agent session "spends" on memory_packet injection, using
+-- the same `_APPROX_CHARS_PER_TOKEN` heuristic as `retrieval.py`'s token
+-- budget (write-side ingestion runs through the free local LM Studio
+-- worker, so only read-side cost is tracked here per the stated business
+-- reason in agent-integration.md's "Что делаем и почему" section).
+CREATE TABLE IF NOT EXISTS agent_activity (
+    agent_name               TEXT PRIMARY KEY,
+    last_seen                TIMESTAMPTZ NOT NULL,
+    last_action               TEXT,   -- 'write' | 'read'
+    turns_written_total       BIGINT DEFAULT 0,
+    retrieve_calls_total      BIGINT DEFAULT 0,
+    read_tokens_estimate_total BIGINT DEFAULT 0
+);

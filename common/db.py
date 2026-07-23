@@ -522,6 +522,55 @@ async def get_worker_heartbeat(worker_name: str) -> Optional[dict]:
         return dict(row) if row else None
 
 
+# --- Agent activity (dashboard "Connected Agents" support) ------------------
+
+
+async def touch_agent_activity(
+    agent_name: str, action: str, tokens_estimate: int = 0
+) -> None:
+    """Upsert `agent_activity` for a client agent — called from `ingest`'s
+    `/ingest/turn` (`action="write"`) and `/retrieve` (`action="read"`,
+    `tokens_estimate` = approx. token cost of the returned memory_packet).
+    Same upsert pattern as `touch_worker_heartbeat`, per
+    agent-integration.md decision #3 — no changes needed on the plugin
+    side, `ingest` already knows `source_agent` from the request body.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO agent_activity (
+                agent_name, last_seen, last_action,
+                turns_written_total, retrieve_calls_total, read_tokens_estimate_total
+            )
+            VALUES ($1, now(), $2, $3, $4, $5)
+            ON CONFLICT (agent_name) DO UPDATE SET
+                last_seen = now(),
+                last_action = EXCLUDED.last_action,
+                turns_written_total = agent_activity.turns_written_total + EXCLUDED.turns_written_total,
+                retrieve_calls_total = agent_activity.retrieve_calls_total + EXCLUDED.retrieve_calls_total,
+                read_tokens_estimate_total = agent_activity.read_tokens_estimate_total + EXCLUDED.read_tokens_estimate_total
+            """,
+            agent_name,
+            action,
+            1 if action == "write" else 0,
+            1 if action == "read" else 0,
+            tokens_estimate,
+        )
+
+
+async def get_all_agent_activity() -> list[dict]:
+    """Full snapshot of `agent_activity` — used by the dashboard's
+    "Connected Agents" section to list every agent that has ever
+    written/read memory, with online/offline derived from `last_seen`
+    staleness (see `dashboard_metrics.py`'s `_check_agent_activity`).
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM agent_activity ORDER BY last_seen DESC")
+        return [dict(r) for r in rows]
+
+
 # --- Dashboard metrics -------------------------------------------------------
 
 

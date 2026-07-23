@@ -88,6 +88,11 @@
 <div id="banner" class="banner ok">Loading…</div>
 
 <section>
+  <h2>Connected Agents</h2>
+  <div class="grid" id="agents-grid"></div>
+</section>
+
+<section>
   <h2>Services</h2>
   <div class="grid" id="services-grid"></div>
 </section>
@@ -137,6 +142,33 @@ function card(title, bodyHtml, extraHeaderHtml) {
 
 function dot(up) {
   return `<span class="dot ${up ? 'up' : 'down'}"></span>`;
+}
+
+function renderAgents(agentActivity) {
+  const grid = document.getElementById('agents-grid');
+  grid.innerHTML = '';
+
+  if (!agentActivity || !agentActivity.ok) {
+    grid.appendChild(card('Connected Agents', '<div class="err-text">unreachable</div>'));
+    return;
+  }
+
+  const agents = agentActivity.agents || [];
+  if (agents.length === 0) {
+    grid.appendChild(card('Connected Agents', '<div class="muted">no agents seen yet</div>'));
+    return;
+  }
+
+  for (const agent of agents) {
+    grid.appendChild(card(agent.agent_name, `
+      <div class="big">${agent.online ? 'ONLINE' : 'OFFLINE'}</div>
+      <div class="row"><span>last seen</span><b>${fmtAge(agent.last_seen_age_seconds)}</b></div>
+      <div class="row"><span>last action</span><b>${agent.last_action || '—'}</b></div>
+      <div class="row"><span>turns written</span><b>${agent.turns_written_total || 0}</b></div>
+      <div class="row"><span>retrieve calls</span><b>${agent.retrieve_calls_total || 0}</b></div>
+      <div class="row"><span>read tokens (est.)</span><b>${agent.read_tokens_estimate_total || 0}</b></div>
+    `, dot(agent.online)));
+  }
 }
 
 function renderServices(services) {
@@ -299,6 +331,7 @@ async function refresh() {
     renderQueue(m);
     renderQuality(m);
     renderStorage(m);
+    renderAgents(m.agent_activity);
   } catch (e) {
     document.getElementById('err').textContent = 'Failed to reach /metrics: ' + e.message;
     document.getElementById('banner').className = 'banner bad';

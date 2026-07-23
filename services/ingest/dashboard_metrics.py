@@ -43,6 +43,16 @@ LM_STUDIO_URL = os.environ.get("LM_STUDIO_URL", "http://192.168.0.11:1234/v1")
 COMPILER_HEARTBEAT_STALE_SECONDS = 15
 CHECK_TIMEOUT_SECONDS = 5.0
 
+# How stale an agent's `last_seen` can be before the dashboard's "Connected
+# Agents" section flags it offline. Client agents (e.g. codemie_code) are
+# far less chatty than the compiler's ~2s poll loop — a turn only lands
+# every few seconds to minutes depending on how fast the user/model is
+# typing — so this is deliberately much more generous than
+# COMPILER_HEARTBEAT_STALE_SECONDS. Not finally tuned (per
+# agent-integration.md risk #5, "can decide along the way"); 15 minutes is
+# a reasonable starting point for a single interactive session.
+AGENT_ACTIVITY_STALE_SECONDS = 15 * 60
+
 
 def _age_seconds(dt: datetime | None) -> float | None:
     if dt is None:
@@ -171,6 +181,43 @@ async def _check_lm_studio() -> dict:
         return {"ok": False, "error": str(exc)}
 
 
+async def _check_agent_activity() -> dict:
+    """ "Connected Agents" dashboard section (agent-integration.md). Lists
+    every agent ever seen in `agent_activity`, online/offline derived from
+    `last_seen` staleness — same shape as the compiler heartbeat check,
+    just per-agent instead of a single named row.
+    """
+    started = time.monotonic()
+    try:
+        rows = await asyncio.wait_for(
+            db.get_all_agent_activity(), timeout=CHECK_TIMEOUT_SECONDS
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("dashboard: agent_activity check failed")
+        return {"ok": False, "error": str(exc)}
+
+    agents = []
+    for row in rows:
+        age = _age_seconds(row["last_seen"])
+        agents.append(
+            {
+                "agent_name": row["agent_name"],
+                "online": age is not None and age <= AGENT_ACTIVITY_STALE_SECONDS,
+                "last_seen_age_seconds": age,
+                "last_action": row["last_action"],
+                "turns_written_total": row["turns_written_total"],
+                "retrieve_calls_total": row["retrieve_calls_total"],
+                "read_tokens_estimate_total": row["read_tokens_estimate_total"],
+            }
+        )
+
+    return {
+        "ok": True,
+        "latency_ms": round((time.monotonic() - started) * 1000, 1),
+        "agents": agents,
+    }
+
+
 async def collect_metrics() -> dict:
     """Run all checks concurrently and assemble the `/metrics` payload.
 
@@ -179,11 +226,12 @@ async def collect_metrics() -> dict:
     dead dependency degrades its own section to `{"ok": False, ...}`
     without blocking or failing the others.
     """
-    postgres, neo4j, qdrant, lm_studio = await asyncio.gather(
+    postgres, neo4j, qdrant, lm_studio, agent_activity = await asyncio.gather(
         _check_postgres(),
         _check_neo4j(),
         _check_qdrant(),
         _check_lm_studio(),
+        _check_agent_activity(),
     )
 
     services_ok = {
@@ -206,4 +254,5 @@ async def collect_metrics() -> dict:
         "neo4j": neo4j,
         "qdrant": qdrant,
         "lm_studio": lm_studio,
+        "agent_activity": agent_activity,
     }

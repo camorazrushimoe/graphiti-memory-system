@@ -83,6 +83,7 @@ async def ingest_turn(payload: IngestTurnRequest):
         payload.session_id, payload.source_agent, status="processing"
     )
     await db.enqueue_compiler_job(payload.session_id)
+    await db.touch_agent_activity(payload.source_agent, action="write")
 
     logger.info(
         "ingested turn %s for session %s (total turns=%d)",
@@ -155,6 +156,23 @@ async def retrieve_memory(payload: RetrieveRequest):
     memory_packet per the spec's Layer 7 format.
     """
     packet = await retrieval.retrieve(payload)
+
+    # Dashboard "Connected Agents" support (agent-integration.md decision
+    # #3): estimate how many tokens this memory_packet costs to inject
+    # into the caller's context, using the same chars-per-token heuristic
+    # as retrieval.py's own token budget. source_agent is optional on
+    # RetrieveRequest — only tracked when the caller identifies itself.
+    if payload.source_agent:
+        packet_text_len = (
+            sum(len(f.text) for f in packet.facts)
+            + sum(len(t.text) for t in packet.open_tasks)
+            + sum(len(d.text) for d in packet.recent_decisions)
+        )
+        tokens_estimate = packet_text_len // retrieval._APPROX_CHARS_PER_TOKEN
+        await db.touch_agent_activity(
+            payload.source_agent, action="read", tokens_estimate=tokens_estimate
+        )
+
     logger.info(
         "retrieve: query=%r -> %d fact(s), %d entity(ies), %d task(s), %d decision(s)",
         payload.query,
