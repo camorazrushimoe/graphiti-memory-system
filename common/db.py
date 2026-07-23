@@ -226,6 +226,164 @@ async def insert_fact(
         )
 
 
+# --- Entity registry (Step 5 — Entity Resolver) ----------------------------
+
+
+async def get_entity(canonical_id: str) -> Optional[dict]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM entities WHERE canonical_id = $1", canonical_id
+        )
+        return dict(row) if row else None
+
+
+async def find_entity_by_alias(surface_form: str) -> Optional[dict]:
+    """Hard-rule lookup: exact case-insensitive match against `canonical_name`
+    or any known `aliases` entry. First tier of the resolver strategy
+    (spec Step 5: "embeddings similarity -> fuzzy string match -> hard
+    rules dict") — cheapest and most precise, tried before the fuzzier
+    strategies.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT * FROM entities
+            WHERE lower(canonical_name) = lower($1)
+               OR EXISTS (
+                   SELECT 1 FROM unnest(aliases) a WHERE lower(a) = lower($1)
+               )
+            LIMIT 1
+            """,
+            surface_form,
+        )
+        return dict(row) if row else None
+
+
+async def get_entities_by_ids(canonical_ids: list[str]) -> list[dict]:
+    """Batch-fetch canonical entity metadata (name/type) for a set of
+    `canonical_id`s — used by the Retrieval endpoint (Layer 7) to resolve
+    the `entity_ids` stored on `facts` rows into displayable
+    `{name, type}` pairs, per the spec's `memory_packet.entities` shape.
+    Post-Entity-Resolver (session 5), `facts.entity_ids` stores
+    `canonical_id`s rather than raw surface-form strings, so a lookup is
+    required to show a human-readable name.
+    """
+    if not canonical_ids:
+        return []
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT canonical_id, canonical_name, type FROM entities WHERE canonical_id = ANY($1::text[])",
+            canonical_ids,
+        )
+        return [dict(r) for r in rows]
+
+
+async def get_all_entities() -> list[dict]:
+    """Full registry snapshot — used for the fuzzy-match tier (rapidfuzz),
+    which needs the candidate pool of canonical names/aliases in memory.
+    Registry is expected to stay small enough for this (thousands, not
+    millions, of entities) for a single-user/small-team local deployment;
+    revisit if it ever needs to scale beyond that.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM entities")
+        return [dict(r) for r in rows]
+
+
+async def insert_entity(
+    canonical_id: str,
+    canonical_name: str,
+    type_: Optional[str],
+    aliases: list[str],
+) -> None:
+    pool = await get_pool()
+    now = datetime.now(timezone.utc)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO entities (canonical_id, canonical_name, type, aliases, first_seen, last_seen)
+            VALUES ($1, $2, $3, $4, $5, $5)
+            ON CONFLICT (canonical_id) DO NOTHING
+            """,
+            canonical_id,
+            canonical_name,
+            type_,
+            aliases,
+            now,
+        )
+
+
+async def add_entity_alias(canonical_id: str, alias: str) -> None:
+    """Append a new surface form to an existing entity's `aliases` array
+    (no-op if already present) and bump `last_seen`.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE entities
+            SET aliases = CASE
+                    WHEN $2 = ANY(aliases) THEN aliases
+                    ELSE array_append(aliases, $2)
+                END,
+                last_seen = $3
+            WHERE canonical_id = $1
+            """,
+            canonical_id,
+            alias,
+            datetime.now(timezone.utc),
+        )
+
+
+# --- Fact lifecycle (Step 6 — Contradiction Checker) ------------------------
+
+
+async def get_active_facts_by_entity(
+    canonical_id: str,
+    type_: Optional[str] = None,
+    exclude_fact_id: Optional[str] = None,
+) -> list[dict]:
+    """Fetch active facts that mention a given canonical entity — the
+    Contradiction Checker's candidate pool (spec Step 6: "existing facts
+    from Graphiti (same entity scope)"; we use Postgres `entity_ids` here
+    instead since it's already indexed and authoritative for `status`,
+    and avoids a second round-trip to Graphiti/Neo4j for this check).
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT * FROM facts
+            WHERE status = 'active'
+              AND $1 = ANY(entity_ids)
+              AND ($2::text IS NULL OR type = $2)
+              AND ($3::text IS NULL OR fact_id != $3)
+            ORDER BY created_at DESC
+            """,
+            canonical_id,
+            type_,
+            exclude_fact_id,
+        )
+        return [dict(r) for r in rows]
+
+
+async def mark_fact_outdated(fact_id: str, superseded_by: str) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE facts SET status = 'outdated', superseded_by = $2
+            WHERE fact_id = $1
+            """,
+            fact_id,
+            superseded_by,
+        )
+
+
 # --- Layer 7 (Retrieval Service) reads --------------------------------------
 
 

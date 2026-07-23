@@ -8,3 +8,4 @@ instructor==1.15.4
 openai==2.47.0
 graphiti-core==0.29.2
 qdrant-client==1.18.0
+rapidfuzz==3.14.5

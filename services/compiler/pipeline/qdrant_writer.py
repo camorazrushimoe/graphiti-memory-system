@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import logging
 import sys
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,6 +35,7 @@ from common.qdrant_client import (  # noqa: E402
     embed_text,
     ensure_collection,
     get_qdrant,
+    point_id_for,
 )
 from schema.memory_event import MemoryItem  # noqa: E402
 
@@ -62,12 +62,12 @@ async def write_memory_item(
         collection_name=FACTS_COLLECTION,
         points=[
             PointStruct(
-                id=str(uuid.uuid5(uuid.NAMESPACE_URL, fact_id)),
+                id=point_id_for(fact_id),
                 vector=vector,
                 payload={
                     "fact_id": fact_id,
                     "text": item.text,
-                    "entity_ids": [e.name for e in item.entities],
+                    "entity_ids": [e.canonical_id or e.name for e in item.entities],
                     "session_id": session_id,
                     "source_agent": source_agent,
                     "type": item.type.value,
@@ -84,3 +84,43 @@ async def write_memory_item(
         FACTS_COLLECTION,
         session_id,
     )
+
+
+async def mark_superseded(old_fact_id: str) -> None:
+    """Step 6 (Contradiction Checker) support — flip the `status` payload
+    field on the old fact's Qdrant point to `outdated`, matching the
+    Postgres update (`common.db.mark_fact_outdated`). Keeps semantic
+    search (services/ingest/retrieval.py's `_semantic_search`) from
+    surfacing outdated facts, per spec Layer 5 ("Status outdated facts are
+    kept but filtered out by default at query time").
+
+    Uses `set_payload` (partial update) rather than re-upserting the whole
+    point, so the vector and other payload fields are left untouched.
+    """
+    client = get_qdrant()
+    await client.set_payload(
+        collection_name=FACTS_COLLECTION,
+        payload={"status": "outdated"},
+        points=[point_id_for(old_fact_id)],
+    )
+    logger.info("qdrant: marked fact %s as outdated", old_fact_id)
+
+
+async def fetch_fact_texts(fact_ids: list[str]) -> dict[str, str]:
+    """Fetch display `text` for a batch of fact_ids from their Qdrant
+    payload — Postgres doesn't store the fact text itself (see
+    services/ingest/retrieval.py's docstring for the same reasoning), so
+    the Contradiction Checker (services/compiler/pipeline/contradiction.py)
+    uses this to get comparison text for its candidate facts.
+    """
+    if not fact_ids:
+        return {}
+    client = get_qdrant()
+    points = await client.retrieve(
+        collection_name=FACTS_COLLECTION,
+        ids=[point_id_for(fid) for fid in fact_ids],
+        with_payload=True,
+    )
+    return {
+        p.payload.get("fact_id"): p.payload.get("text", "") for p in points if p.payload
+    }

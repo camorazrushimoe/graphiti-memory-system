@@ -68,3 +68,30 @@ async def write_memory_item(
         session_id,
         item.type.value,
     )
+
+
+async def mark_superseded(old_fact_id: str, new_fact_id: str) -> None:
+    """Step 6 (Contradiction Checker) support — create the
+    `(MemoryItem)-[:SUPERSEDES]->(MemoryItem)` link the spec's graph model
+    calls for (Layer 4 "Graph model"), between the two Graphiti Episodic
+    nodes named after each fact_id (see `write_memory_item` above — the
+    episode `name` is always the fact_id).
+
+    Both episodes are kept (per spec: "Both versions are kept, the temporal
+    graph supports this natively") — this only adds the supersedes edge,
+    it does not delete or modify the old episode's content.
+    """
+    graphiti = get_graphiti()
+    await graphiti.driver.execute_query(
+        """
+        MATCH (old:Episodic {name: $old_name}), (new:Episodic {name: $new_name})
+        MERGE (new)-[:SUPERSEDES]->(old)
+        """,
+        old_name=old_fact_id,
+        new_name=new_fact_id,
+    )
+    logger.info(
+        "graphiti: marked fact %s as superseded by %s (SUPERSEDES edge)",
+        old_fact_id,
+        new_fact_id,
+    )

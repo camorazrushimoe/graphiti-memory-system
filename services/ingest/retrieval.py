@@ -242,6 +242,15 @@ async def retrieve(request: RetrieveRequest) -> MemoryPacket:
 
     fact_texts = await _fact_texts_from_qdrant([fid for fid, _, _ in scored])
 
+    # Resolve entity_ids (canonical_id post-Entity-Resolver, or a raw
+    # surface-form string on older pre-resolver facts) to display
+    # {canonical_name, type} — see common.db.get_entities_by_ids docstring.
+    all_entity_keys = {key for _, _, row in scored for key in (row["entity_ids"] or [])}
+    entity_registry = {
+        e["canonical_id"]: e
+        for e in await db.get_entities_by_ids(list(all_entity_keys))
+    }
+
     facts: list[MemoryPacketFact] = []
     entities_seen: dict[str, MemoryPacketEntity] = {}
     open_tasks: list[MemoryPacketTask] = []
@@ -274,16 +283,19 @@ async def retrieve(request: RetrieveRequest) -> MemoryPacket:
             )
         )
 
-        for entity_name in row["entity_ids"] or []:
-            if entity_name not in entities_seen:
-                entities_seen[entity_name] = MemoryPacketEntity(
-                    name=entity_name, last_seen=date_str
+        for entity_key in row["entity_ids"] or []:
+            resolved = entity_registry.get(entity_key)
+            display_name = resolved["canonical_name"] if resolved else entity_key
+            display_type = resolved["type"] if resolved else None
+            if display_name not in entities_seen:
+                entities_seen[display_name] = MemoryPacketEntity(
+                    name=display_name, type=display_type, last_seen=date_str
                 )
             elif date_str and (
-                entities_seen[entity_name].last_seen is None
-                or date_str > entities_seen[entity_name].last_seen
+                entities_seen[display_name].last_seen is None
+                or date_str > entities_seen[display_name].last_seen
             ):
-                entities_seen[entity_name].last_seen = date_str
+                entities_seen[display_name].last_seen = date_str
 
         if row["type"] == "task":
             open_tasks.append(MemoryPacketTask(text=text, status="open"))

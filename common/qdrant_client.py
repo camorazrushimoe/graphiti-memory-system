@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
+from typing import Optional
 
 from openai import OpenAI
 from qdrant_client import AsyncQdrantClient
@@ -30,6 +32,13 @@ EMBEDDING_MODEL = os.environ.get(
 EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "768"))
 
 FACTS_COLLECTION = "facts"
+# Layer 5 per spec defines three collections (entities/episodes/facts).
+# `entities` was deferred in session 3 ("no stable canonical entity to embed
+# yet") — now used by the Entity Resolver (session 5,
+# services/compiler/pipeline/resolver.py) as its similarity-search index:
+# one point per canonical entity, payload {canonical_id, canonical_name,
+# type}. `episodes` collection is still not implemented.
+ENTITIES_COLLECTION = "entities"
 
 _qdrant: AsyncQdrantClient | None = None
 _embed_client: OpenAI | None = None
@@ -75,6 +84,14 @@ def embed_text(text: str) -> list[float]:
     client = get_embed_client()
     response = client.embeddings.create(model=EMBEDDING_MODEL, input=text)
     return response.data[0].embedding
+
+
+def point_id_for(key: str) -> str:
+    """Deterministic Qdrant point UUID for a given natural key (fact_id or
+    canonical entity_id) — lets writers upsert idempotently by re-deriving
+    the same point id from the key instead of tracking a separate mapping.
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, key))
 
 
 async def close_qdrant() -> None:
