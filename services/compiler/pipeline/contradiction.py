@@ -64,6 +64,27 @@ REVIEW_THRESHOLD = 0.6
 NEAR_DUPLICATE_THRESHOLD = 92
 
 
+def is_near_duplicate(text_a: str, text_b: str) -> bool:
+    """Cheap rule tier (pure, no LLM/DB/IO) — extracted for unit-testing
+    (session 7). True if two fact texts are similar enough to be treated
+    as restating the same information rather than a real contradiction,
+    letting `check_contradiction` skip the LLM call for that candidate.
+    """
+    return fuzz.ratio(text_a.lower(), text_b.lower()) >= NEAR_DUPLICATE_THRESHOLD
+
+
+def action_for_score(contradicts: bool, score: float) -> str:
+    """Map an LLM judgment to the spec's three-way action (pure function,
+    extracted for unit-testing in session 7): `none` if the LLM says it
+    doesn't contradict or the score is below the review floor, else
+    `auto_update` for score > 0.85 or `flag_for_review` for 0.6-0.85, per
+    spec Step 6's stated thresholds.
+    """
+    if not contradicts or score < REVIEW_THRESHOLD:
+        return "none"
+    return "auto_update" if score > AUTO_UPDATE_THRESHOLD else "flag_for_review"
+
+
 class _ContradictionJudgment(BaseModel):
     contradicts: bool = Field(
         description=(
@@ -153,17 +174,16 @@ async def check_contradiction(
         if not existing_text:
             continue  # can't compare without the existing fact's text
 
-        similarity = fuzz.ratio(item.text.lower(), existing_text.lower())
-        if similarity >= NEAR_DUPLICATE_THRESHOLD:
+        if is_near_duplicate(item.text, existing_text):
             # Cheap rule tier: near-identical restatement, not a
             # contradiction — skip the LLM call for this candidate.
             continue
 
         contradicts, score = _judge_with_llm(existing_text, item.text)
-        if not contradicts or score < REVIEW_THRESHOLD:
+        action = action_for_score(contradicts, score)
+        if action == "none":
             continue
 
-        action = "auto_update" if score > AUTO_UPDATE_THRESHOLD else "flag_for_review"
         logger.info(
             "contradiction checker: new item contradicts fact %s (score=%.2f, action=%s)",
             candidate["fact_id"],

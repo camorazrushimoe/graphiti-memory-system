@@ -275,7 +275,7 @@ async def get_entities_by_ids(canonical_ids: list[str]) -> list[dict]:
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT canonical_id, canonical_name, type FROM entities WHERE canonical_id = ANY($1::text[])",
+            "SELECT canonical_id, canonical_name, type, aliases FROM entities WHERE canonical_id = ANY($1::text[])",
             canonical_ids,
         )
         return [dict(r) for r in rows]
@@ -433,3 +433,60 @@ async def get_recent_facts_by_type(type_: str, limit: int = 5) -> list[dict]:
             limit,
         )
         return [dict(r) for r in rows]
+
+
+# --- Review queue (Step 6 — Contradiction Checker "flag_for_review") -------
+
+
+async def insert_review_item(
+    new_fact_id: str, existing_fact_id: str, contradiction_score: float
+) -> None:
+    """Record a `flag_for_review` contradiction (score 0.6-0.85, per spec)
+    instead of auto-applying the outdated+supersedes treatment. See
+    `schema/init.sql`'s `review_queue` table docstring for the rationale.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO review_queue (new_fact_id, existing_fact_id, contradiction_score, status)
+            VALUES ($1, $2, $3, 'pending')
+            """,
+            new_fact_id,
+            existing_fact_id,
+            contradiction_score,
+        )
+
+
+async def get_pending_reviews(limit: int = 50) -> list[dict]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT * FROM review_queue WHERE status = 'pending'
+            ORDER BY created_at ASC
+            LIMIT $1
+            """,
+            limit,
+        )
+        return [dict(r) for r in rows]
+
+
+async def resolve_review(review_id: int, status: str) -> Optional[dict]:
+    """Mark a review row `approved` or `rejected`. Returns the row (before
+    the caller decides whether to also apply outdated+supersedes for an
+    'approved' verdict) or None if `review_id` doesn't exist.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE review_queue
+            SET status = $2, resolved_at = now()
+            WHERE review_id = $1 AND status = 'pending'
+            RETURNING *
+            """,
+            review_id,
+            status,
+        )
+        return dict(row) if row else None

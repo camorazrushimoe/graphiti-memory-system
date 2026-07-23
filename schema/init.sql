@@ -56,3 +56,25 @@ CREATE TABLE IF NOT EXISTS compiler_jobs (
 CREATE INDEX IF NOT EXISTS idx_compiler_jobs_status ON compiler_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_facts_status ON facts(status);
 CREATE INDEX IF NOT EXISTS idx_facts_session ON facts(session_id);
+
+-- Session 7: review queue for Contradiction Checker's `flag_for_review`
+-- action (contradiction score 0.6-0.85, per spec Layer 3 Step 6). Prior to
+-- this table, `flag_for_review` was handled identically to `auto_update`
+-- (old fact marked outdated + supersedes link created immediately) — a
+-- known divergence from the spec's literal "flag for review" language,
+-- logged in the tech-spec implementation log since session 6. Rows here
+-- represent a contradiction the system is *not confident enough* to apply
+-- automatically; the new fact is still written normally (per spec: "both
+-- versions are kept"), but the old fact is left `active` and unlinked
+-- until a human (or a future auto-resolution pass) reviews the pair.
+CREATE TABLE IF NOT EXISTS review_queue (
+    review_id           SERIAL PRIMARY KEY,
+    new_fact_id         TEXT REFERENCES facts(fact_id),
+    existing_fact_id     TEXT REFERENCES facts(fact_id),
+    contradiction_score FLOAT,
+    status              TEXT DEFAULT 'pending',  -- pending | approved | rejected
+    created_at           TIMESTAMPTZ DEFAULT now(),
+    resolved_at           TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_queue_status ON review_queue(status);

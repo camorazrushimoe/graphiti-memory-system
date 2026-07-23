@@ -37,8 +37,15 @@ FACTS_COLLECTION = "facts"
 # yet") — now used by the Entity Resolver (session 5,
 # services/compiler/pipeline/resolver.py) as its similarity-search index:
 # one point per canonical entity, payload {canonical_id, canonical_name,
-# type}. `episodes` collection is still not implemented.
+# type}. `episodes` was deferred alongside it — now implemented in session
+# 7 (services/compiler/pipeline/episode_writer.py): one point per compiler
+# Episode (not per MemoryItem), payload {episode_id, session_id,
+# topic_hint, episode_type, message_ids, timestamp}, embedding the
+# episode's full text as its "summary" (no separate summarization pass
+# exists yet — the episode text itself, per spec Step 2, already covers
+# one coherent topic and is short enough to embed directly).
 ENTITIES_COLLECTION = "entities"
+EPISODES_COLLECTION = "episodes"
 
 _qdrant: AsyncQdrantClient | None = None
 _embed_client: OpenAI | None = None

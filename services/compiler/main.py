@@ -14,22 +14,31 @@ Pipeline steps wired so far (per MVP order in the tech spec):
   1. Normalizer      (pure Python)
   2. Episode Splitter (DSPy)
   3. Episode Classifier (DSPy)
+  3b. Qdrant `episodes` write (Layer 5 — one point per episode, session 7)
   4. Memory Extractor (Instructor, JSON schema)
-  5. Entity Resolver  (embeddings + rapidfuzz + hard-rules dict)
-  6. Contradiction Checker (rules + Gemma 4B for ambiguous cases)
+  5. Entity Resolver  (embeddings + rapidfuzz + hard-rules dict + curated
+     alias groups, session 7)
+  6. Contradiction Checker (rules + Gemma 4B for ambiguous cases) — splits
+     into `auto_update` (score > 0.85, applied immediately) vs.
+     `flag_for_review` (score 0.6-0.85, queued in `review_queue` instead of
+     being auto-applied, session 7)
   7. Memory Selector  (quality gate — confidence + acknowledgment rules)
-  8. Graphiti write   (Layer 4 graph core — one episode per MemoryItem)
+  8. Graphiti write   (Layer 4 graph core — one episode per MemoryItem,
+     idempotent by deterministic fact_id, session 7)
   9. Qdrant write     (Layer 5 vector index — one point per MemoryItem)
 
 All MVP pipeline steps (1-11 in the tech spec) are now wired end-to-end.
+`fact_id` (see `_deterministic_fact_id` below) is a stable dedup key
+derived from `(episode_id, item_index)` rather than a fresh random UUID
+per attempt, closing the retry-duplication gap tracked since session 3.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import sys
-import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root
@@ -41,6 +50,7 @@ from schema.memory_event import EpisodeType  # noqa: E402
 from services.compiler.pipeline import normalizer  # noqa: E402
 from services.compiler.pipeline.classifier import classify_episode  # noqa: E402
 from services.compiler.pipeline.contradiction import check_contradiction  # noqa: E402
+from services.compiler.pipeline.episode_writer import write_episode  # noqa: E402
 from services.compiler.pipeline.extractor import extract_memory_items  # noqa: E402
 from services.compiler.pipeline.graphiti_writer import (  # noqa: E402
     mark_superseded as mark_superseded_graphiti,
@@ -61,6 +71,42 @@ logger = logging.getLogger("compiler")
 
 POLL_INTERVAL_SECONDS = 2.0
 MIN_WINDOW_SIZE = 4  # spec: process once at least this many *new* turns are buffered
+
+
+def _deterministic_fact_id(episode_id: str, item_index: int) -> str:
+    """Session 7 — stable dedup key for a `MemoryItem`, replacing the old
+    `f"fact_{uuid.uuid4().hex[:12]}"` (a fresh random id on every attempt).
+
+    Derived from `(episode_id, item_index)` — the episode a MemoryItem
+    came from, plus its position in the Selector's output list for that
+    episode — both of which are stable across retries of the *same* job
+    (the extractor is deterministic enough in practice for this session's
+    scope: same episode text -> same episode_id already, and the Selector
+    only filters, never reorders, so index within the kept list is stable
+    too). This means a retried job that re-reaches the same item recomputes
+    the *same* fact_id, so:
+      - `graphiti_writer.write_memory_item` skips re-adding the episode
+        (see its docstring "Idempotency" note)
+      - `qdrant_writer.write_memory_item` upserts the same point id (no-op
+        duplicate)
+      - `db.insert_fact` is `ON CONFLICT (fact_id) DO NOTHING` (no-op
+        duplicate row)
+    closing the retry-duplication gap called out in the tech-spec
+    implementation log since session 3.
+
+    Known residual limitation: if the extractor's output for the *same*
+    episode text genuinely varies between attempts (LLM non-determinism —
+    e.g. splits one sentence into two items on retry instead of one), the
+    index-based key can drift and this degrades back to the old duplicate
+    behavior for that item only. Not fully solved without content-hashing
+    the item text itself, which was considered but rejected for now since
+    it would also treat two textually-identical-but-legitimately-distinct
+    memories (e.g. the same decision restated in two different episodes)
+    as collisions — deterministic-per-attempt is judged good enough for
+    the common case (transient network/LM Studio timeout mid-job).
+    """
+    digest = hashlib.sha256(f"{episode_id}:{item_index}".encode()).hexdigest()
+    return f"fact_{digest[:24]}"
 
 
 def _new_tail_turns(all_turns: list, last_processed_message_id: str | None) -> list:
@@ -141,6 +187,21 @@ async def process_job(job: dict) -> None:
         if classified.episode_type == EpisodeType.META:
             continue  # small-talk / acknowledgments — skip extraction entirely
 
+        # Layer 5 `episodes` collection (session 7) — embed and index this
+        # episode's text regardless of what extraction below finds, so a
+        # future retrieval pass can surface episodes by topic even when no
+        # individual item made it past the Memory Selector. Non-fatal: a
+        # failure here shouldn't block fact extraction/writes, which are
+        # the pipeline's primary output.
+        try:
+            await write_episode(classified)
+        except Exception:
+            logger.exception(
+                "session %s: episode %s qdrant episodes-collection write failed (non-fatal)",
+                session_id,
+                classified.episode_id,
+            )
+
         items = extract_memory_items(classified, classified.episode_type)
         logger.info(
             "session %s: episode %s extracted %d candidate item(s)",
@@ -157,16 +218,20 @@ async def process_job(job: dict) -> None:
         #
         # Order note: Graphiti write happens BEFORE the Postgres insert. If
         # Graphiti fails and the job is retried, the retry re-runs the
-        # extractor and gets a *new* fact_id — writing to Postgres first
-        # would leave an orphan `facts` row (no matching graph episode) on
-        # every failed attempt. Writing to Graphiti first means a failed
+        # extractor and (per the docstring on `_deterministic_fact_id`,
+        # session 7) recomputes the *same* fact_id for the same
+        # `(episode_id, item_index)` — writing to Postgres first would
+        # otherwise leave an orphan `facts` row (no matching graph episode)
+        # on every failed attempt. Writing to Graphiti first means a failed
         # attempt leaves no trace in either store, and only a successful
-        # attempt is reflected in Postgres too. This still does not fully
-        # solve retry duplication if extraction *succeeds* but a *later*
-        # item in the same episode causes the job to fail and retry
-        # (earlier items in this loop are already committed to both
-        # stores on retry #2) — full idempotency needs a proper dedup key,
-        # deferred to a future session.
+        # attempt is reflected in Postgres too. Combined with the
+        # idempotent dedup key, a retry that re-reaches an item already
+        # committed on a prior attempt within the same job now safely
+        # no-ops in all three stores instead of duplicating it (closes the
+        # gap called out here since session 3 — see
+        # `_deterministic_fact_id`'s docstring for the one residual edge
+        # case that isn't fully covered: non-deterministic extractor
+        # output across attempts).
         selected_items = select_memory_items(items)
         logger.info(
             "session %s: episode %s selector kept %d/%d item(s)",
@@ -175,7 +240,7 @@ async def process_job(job: dict) -> None:
             len(selected_items),
             len(items),
         )
-        for item in selected_items:
+        for item_index, item in enumerate(selected_items):
             # Step 5 — Entity Resolver: replace each raw entity surface
             # form with its canonical_id (registering new canonical
             # entities as needed). Runs before the contradiction check
@@ -208,13 +273,14 @@ async def process_job(job: dict) -> None:
                     fact_texts = await fetch_fact_texts(candidate_ids)
 
             contradiction = await check_contradiction(item, fact_texts)
-            if contradiction.action in ("auto_update", "flag_for_review"):
-                # Spec: >0.85 auto-update, 0.6-0.85 flag for review. MVP
-                # applies the same outdated+supersedes treatment to both —
-                # a real "review queue" surface for flag_for_review is not
-                # implemented yet, tracked as follow-up work.
+            if contradiction.action == "auto_update":
+                # Spec: contradiction score > 0.85 -> automatic update. Old
+                # fact is marked outdated in all three stores and linked
+                # via a SUPERSEDES edge; the new fact is still written
+                # normally below regardless (per spec: "Both versions are
+                # kept").
                 old_fact_id = contradiction.contradicts_fact_id
-                fact_id = f"fact_{uuid.uuid4().hex[:12]}"
+                fact_id = _deterministic_fact_id(classified.episode_id, item_index)
                 try:
                     await write_to_graphiti(
                         item=item,
@@ -265,7 +331,70 @@ async def process_job(job: dict) -> None:
                 total_items += 1
                 continue
 
-            fact_id = f"fact_{uuid.uuid4().hex[:12]}"
+            if contradiction.action == "flag_for_review":
+                # Session 7: spec's "0.6-0.85 flags for review" is now a
+                # real review queue (schema/init.sql `review_queue` table)
+                # instead of being treated identically to auto_update (see
+                # tech-spec implementation log, session 6 known
+                # limitation). The old fact is left `active`/unlinked; the
+                # new fact is written normally below (per spec: "both
+                # versions kept") and a pending review row records the
+                # pair for a human (or future auto-resolution pass) to
+                # adjudicate via `db.resolve_review`.
+                old_fact_id = contradiction.contradicts_fact_id
+                fact_id = _deterministic_fact_id(classified.episode_id, item_index)
+                try:
+                    await write_to_graphiti(
+                        item=item,
+                        fact_id=fact_id,
+                        session_id=session_id,
+                        source_agent=normalized.source_agent,
+                    )
+                except Exception:
+                    logger.exception(
+                        "session %s: graphiti write failed for fact %s",
+                        session_id,
+                        fact_id,
+                    )
+                    raise
+                try:
+                    await write_to_qdrant(
+                        item=item,
+                        fact_id=fact_id,
+                        session_id=session_id,
+                        source_agent=normalized.source_agent,
+                    )
+                except Exception:
+                    logger.exception(
+                        "session %s: qdrant write failed for fact %s",
+                        session_id,
+                        fact_id,
+                    )
+                    raise
+                await db.insert_fact(
+                    fact_id=fact_id,
+                    entity_ids=[e.canonical_id or e.name for e in item.entities],
+                    type_=item.type.value,
+                    confidence=item.confidence,
+                    session_id=session_id,
+                    source_agent=normalized.source_agent,
+                )
+                await db.insert_review_item(
+                    new_fact_id=fact_id,
+                    existing_fact_id=old_fact_id,
+                    contradiction_score=contradiction.contradiction_score,
+                )
+                logger.info(
+                    "session %s: fact %s flagged for review against %s (contradiction score=%.2f)",
+                    session_id,
+                    fact_id,
+                    old_fact_id,
+                    contradiction.contradiction_score,
+                )
+                total_items += 1
+                continue
+
+            fact_id = _deterministic_fact_id(classified.episode_id, item_index)
             try:
                 await write_to_graphiti(
                     item=item,
@@ -289,13 +418,13 @@ async def process_job(job: dict) -> None:
                 )
             except Exception:
                 # Qdrant failure after a successful Graphiti write leaves the
-                # graph and the vector index out of sync for this fact_id.
-                # Surfacing the error (job retry) re-runs extraction and
-                # produces a *new* fact_id, so the Graphiti episode from
-                # this attempt becomes an orphan (no Qdrant/Postgres entry).
-                # Same known limitation as the Graphiti-write ordering
-                # comment above — proper idempotency needs a stable dedup
-                # key, deferred to a future session.
+                # graph and the vector index out of sync for this fact_id
+                # *until the retry*. Since `fact_id` is now deterministic
+                # (session 7 — see `_deterministic_fact_id`), the retry
+                # recomputes the same fact_id: the Graphiti write above
+                # becomes a no-op (episode already exists) and this Qdrant
+                # write is attempted again for real, closing the gap that
+                # used to leave the Graphiti episode permanently orphaned.
                 logger.exception(
                     "session %s: qdrant write failed for fact %s",
                     session_id,

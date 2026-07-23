@@ -27,10 +27,17 @@ already gathered from semantic+graph search, plus a small Postgres-only
 top-up for open_tasks/recent_decisions if the search didn't surface any
 task/decision facts — since we don't want an empty "open tasks" section
 just because the query embedding didn't happen to score a task highly.
+
+Session 7 follow-up: `recency_days` and `project_scope` (accepted on
+`RetrieveRequest` per the spec's request schema but previously ignored,
+see the tech-spec implementation log's long-standing "known limitation")
+are now applied as post-filters — see `_apply_recency_days_filter` and
+`_apply_project_scope_filter` below and their call sites in `retrieve()`.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -89,19 +96,33 @@ DEFAULT_TOKEN_BUDGET = 2000  # spec default; ~4 chars/token heuristic below
 _APPROX_CHARS_PER_TOKEN = 4
 
 
-def _recency_weight(created_at: Optional[datetime]) -> float:
+def _recency_weight(
+    created_at: Optional[datetime], full_weight_days: int = RECENCY_FULL_WEIGHT_DAYS
+) -> float:
+    """Linear recency decay: 1.0 for facts within `full_weight_days`,
+    decaying to `RECENCY_FLOOR_WEIGHT` by `RECENCY_FLOOR_WEIGHT_DAYS`.
+
+    `full_weight_days` defaults to the spec's fixed anchor (7) but can be
+    overridden per-request via `RetrieveRequest.recency_days` (session 7 —
+    see `retrieve()`), which lets a caller ask for a stronger or weaker
+    recency bias without changing the floor anchor (90 days / 0.5) that
+    the spec also defines. If a caller-supplied `recency_days` is >= the
+    floor anchor, the floor anchor is pushed out to match so the decay
+    curve stays monotonic (no floor-before-full-weight inversion).
+    """
     if created_at is None:
         return RECENCY_FLOOR_WEIGHT
     now = datetime.now(timezone.utc)
     if created_at.tzinfo is None:
         created_at = created_at.replace(tzinfo=timezone.utc)
     age_days = max((now - created_at).total_seconds() / 86400.0, 0.0)
-    if age_days <= RECENCY_FULL_WEIGHT_DAYS:
+    floor_days = max(RECENCY_FLOOR_WEIGHT_DAYS, full_weight_days + 1)
+    if age_days <= full_weight_days:
         return 1.0
-    if age_days >= RECENCY_FLOOR_WEIGHT_DAYS:
+    if age_days >= floor_days:
         return RECENCY_FLOOR_WEIGHT
-    span = RECENCY_FLOOR_WEIGHT_DAYS - RECENCY_FULL_WEIGHT_DAYS
-    frac = (age_days - RECENCY_FULL_WEIGHT_DAYS) / span
+    span = floor_days - full_weight_days
+    frac = (age_days - full_weight_days) / span
     return 1.0 - frac * (1.0 - RECENCY_FLOOR_WEIGHT)
 
 
@@ -170,11 +191,12 @@ def _combined_score(
     semantic_scores: dict[str, float],
     graph_fact_ids: set[str],
     created_at: Optional[datetime],
+    full_weight_days: int = RECENCY_FULL_WEIGHT_DAYS,
 ) -> float:
     base = semantic_scores.get(fact_id, 0.0)
     if fact_id in graph_fact_ids:
         base += GRAPH_CENTRALITY_BONUS
-    return base * _recency_weight(created_at)
+    return base * _recency_weight(created_at, full_weight_days)
 
 
 async def _fact_texts_from_qdrant(fact_ids: list[str]) -> dict[str, str]:
@@ -203,14 +225,73 @@ def _qdrant_point_ids(fact_ids: list[str]) -> list[str]:
     return [str(uuid.uuid5(uuid.NAMESPACE_URL, fid)) for fid in fact_ids]
 
 
+async def _apply_project_scope_filter(
+    scored: list[tuple[str, float, dict]], project_scope: str
+) -> list[tuple[str, float, dict]]:
+    """Session 7 — narrow `scored` to facts matching `project_scope`.
+
+    Matches (case-insensitive substring) against either:
+      - the fact's own text (fetched from Qdrant payload, same as the
+        final assembly step needs anyway), or
+      - any of its resolved entity canonical names/aliases.
+
+    This is a best-effort topic filter, not a structured field lookup —
+    the spec's Layer 6 `facts` table has no dedicated "project" column, so
+    there's no exact-match alternative available without a schema change.
+    """
+    if not scored:
+        return scored
+    needle = project_scope.strip().lower()
+    if not needle:
+        return scored
+
+    fact_ids = [fid for fid, _, _ in scored]
+    texts = await _fact_texts_from_qdrant(fact_ids)
+
+    all_entity_ids = {eid for _, _, row in scored for eid in (row["entity_ids"] or [])}
+    entities = await db.get_entities_by_ids(list(all_entity_ids))
+    entity_haystack_by_id = {
+        e["canonical_id"]: " ".join(
+            [e["canonical_name"] or ""] + list(e.get("aliases") or [])
+        ).lower()
+        for e in entities
+    }
+
+    filtered = []
+    for fact_id, score, row in scored:
+        haystack = texts.get(fact_id, "").lower()
+        for entity_id in row["entity_ids"] or []:
+            haystack += " " + (
+                entity_haystack_by_id.get(entity_id) or entity_id.lower()
+            )
+        if needle in haystack:
+            filtered.append((fact_id, score, row))
+    return filtered
+
+
 async def retrieve(request: RetrieveRequest) -> MemoryPacket:
     """Run the parallel retrieval strategy and assemble a `memory_packet`."""
-    semantic_scores = await _semantic_search(request.query, request.top_k)
-    graph_fact_ids = await _graph_traversal(request.query, request.top_k)
+    # Session 7: genuinely run semantic search (Qdrant) and graph
+    # traversal (Graphiti/Neo4j) concurrently via `asyncio.gather` instead
+    # of sequential awaits — see the tech-spec implementation log's
+    # session 4/5 "known limitation" (both are independent I/O-bound calls
+    # to local services, so there's no reason to serialize them).
+    semantic_scores, graph_fact_ids = await asyncio.gather(
+        _semantic_search(request.query, request.top_k),
+        _graph_traversal(request.query, request.top_k),
+    )
 
     candidate_ids = set(semantic_scores) | graph_fact_ids
     fact_rows = await db.get_facts_by_ids(list(candidate_ids))
     fact_by_id = {row["fact_id"]: row for row in fact_rows}
+
+    # Session 7: `recency_days` narrows the "full weight" recency anchor
+    # (spec's fixed 7-day anchor) to whatever the caller asks for, instead
+    # of being silently ignored. A caller passing e.g. `recency_days: 1`
+    # is asking for a *stronger* recency bias (only today's facts stay at
+    # weight 1.0); `recency_days: 30` asks for a gentler one. Defaults to
+    # the spec's built-in 7-day anchor when omitted.
+    full_weight_days = request.recency_days or RECENCY_FULL_WEIGHT_DAYS
 
     # Per spec strategy #3: exclude status=outdated unless the query
     # explicitly asks for history. We don't yet have a history-query
@@ -233,11 +314,26 @@ async def retrieve(request: RetrieveRequest) -> MemoryPacket:
             # `source_agent`, honor it as an opt-in filter when provided.
             continue
         score = _combined_score(
-            fact_id, semantic_scores, graph_fact_ids, row["created_at"]
+            fact_id,
+            semantic_scores,
+            graph_fact_ids,
+            row["created_at"],
+            full_weight_days,
         )
         scored.append((fact_id, score, row))
 
     scored.sort(key=lambda t: t[1], reverse=True)
+
+    # Session 7: `project_scope` — the spec's example ("narrow to topic")
+    # doesn't map to any existing column on `facts` (no "project" field),
+    # so this is implemented as a case-insensitive substring match against
+    # either the fact's text or any of its resolved entity names/aliases.
+    # Applied *after* scoring/sorting (it's a hard filter, not a ranking
+    # signal) and before the top_k cut, so a narrow scope doesn't waste the
+    # budget on facts that get filtered out anyway.
+    if request.project_scope:
+        scored = await _apply_project_scope_filter(scored, request.project_scope)
+
     scored = scored[: request.top_k]
 
     fact_texts = await _fact_texts_from_qdrant([fid for fid, _, _ in scored])

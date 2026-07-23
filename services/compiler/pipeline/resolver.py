@@ -34,6 +34,17 @@ precise (exact match) than similarity search, so trying them first is a
 pure optimization that produces identical resolutions for anything the
 hard-rules dict actually covers, and falls through to the spec's stated
 order for everything else.
+
+Session 7 follow-up (see tech-spec implementation log, "known limitation"
+from session 6): a static `KNOWN_ALIAS_GROUPS` dict was added as a
+*curated* hard-rules layer, checked before the DB-backed hard-rules tier.
+It maps well-known surface-form variants (e.g. "Anthropic Claude",
+"Claude CLI") to one preferred canonical name ("Claude") so that the
+first-ever mention of any variant registers/looks up the *same* canonical
+entity, instead of relying on embedding similarity (which failed to merge
+"Claude" and "Anthropic Claude" in session 6's live test at the old 0.80
+threshold). `EMBEDDING_MATCH_THRESHOLD` was also lowered 0.80 -> 0.70 for
+surface forms not covered by the curated dict.
 """
 
 from __future__ import annotations
@@ -61,19 +72,60 @@ from schema.memory_event import Entity  # noqa: E402
 logger = logging.getLogger("compiler.resolver")
 
 # Cosine similarity threshold above which two entity surface forms are
-# considered the same canonical entity. Not verified as extensively as the
-# retrieval endpoint's semantic threshold (services/ingest/retrieval.py) —
-# chosen conservatively high since a false-merge (two distinct entities
-# treated as one) is worse for the graph than a false-split (duplicate
-# entities that a human/future pass can merge later). Revisit with real
-# resolver test cases once more entities accumulate.
-EMBEDDING_MATCH_THRESHOLD = 0.80
+# considered the same canonical entity. Originally 0.80 (session 5,
+# unverified). Session 6's live test found a real false-split at that
+# threshold: "Anthropic Claude" and "Claude" scored below 0.80 and
+# registered as two distinct canonical entities. Lowered to 0.70 in
+# session 7 — still conservative enough to avoid merging clearly distinct
+# tools/concepts, but permissive enough to catch that kind of
+# name-prefix/suffix variation. See also `KNOWN_ALIAS_GROUPS` below, which
+# handles specific known-problematic pairs deterministically instead of
+# relying on the embedding model to score them highly.
+EMBEDDING_MATCH_THRESHOLD = 0.70
 
 # rapidfuzz token_sort_ratio (0-100) threshold for a fuzzy-match hit —
 # catches near-identical strings (typos, abbreviations) that the embedding
 # tier might not score highly enough (embeddings capture semantic
 # similarity, not surface-form similarity).
 FUZZY_MATCH_THRESHOLD = 88
+
+# Curated hard-rules groups (session 7) — each inner list is a set of
+# surface forms known to refer to the same canonical entity, with the
+# FIRST element in each group used as the canonical name when none of the
+# variants have been registered yet. Checked case-insensitively before the
+# DB-backed `find_entity_by_alias` tier (which only matches forms already
+# recorded from a *previous* resolution) so that the *first-ever* mention
+# of any variant in a group resolves consistently to the same canonical
+# name, e.g. seeing "Anthropic Claude" before "Claude" still ends up
+# registering canonical entity "Claude", not "Anthropic Claude".
+KNOWN_ALIAS_GROUPS: list[list[str]] = [
+    ["Claude", "Anthropic Claude", "Claude CLI", "Claude Cli", "Claude Code"],
+    ["LM Studio", "LMStudio", "LM-Studio"],
+    ["Graphiti", "Graphiti Core", "graphiti-core"],
+    ["Neo4j", "Neo4J", "Neo 4j"],
+    ["Qdrant", "QDrant"],
+    ["Postgres", "PostgreSQL", "Postgres SQL"],
+    ["DSPy", "DSPy AI", "dspy-ai"],
+]
+
+# surface_form.lower() -> (canonical_name, all other known variants)
+_ALIAS_LOOKUP: dict[str, tuple[str, list[str]]] = {}
+for _group in KNOWN_ALIAS_GROUPS:
+    _canonical_name = _group[0]
+    for _variant in _group:
+        _ALIAS_LOOKUP[_variant.lower()] = (_canonical_name, _group)
+
+
+def _find_via_known_alias_group(surface_form: str) -> tuple[str, list[str]] | None:
+    """Look up a curated alias group for this surface form.
+
+    Returns `(canonical_name, all_variants)` if the surface form belongs to
+    one of `KNOWN_ALIAS_GROUPS`, else None. The caller still needs to check
+    Postgres for whether `canonical_name` (or any variant) is already
+    registered — this only tells us *which* canonical name to use/register,
+    it doesn't do the DB lookup itself.
+    """
+    return _ALIAS_LOOKUP.get(surface_form.strip().lower())
 
 
 async def _find_via_embedding(surface_form: str) -> str | None:
@@ -177,6 +229,25 @@ async def resolve_entity(entity: Entity) -> str:
     surface_form = entity.name.strip()
     if not surface_form:
         return await _register_new_entity(surface_form or "unknown", entity.type)
+
+    # Tier 0 (session 7) — curated alias groups: if this surface form (or
+    # its canonical name) is already registered under any variant in its
+    # group, resolve to that; the DB-backed hard-rules tier below wouldn't
+    # catch this on a variant's *first* mention (e.g. seeing "Anthropic
+    # Claude" when only "Claude" is registered so far, with no alias link
+    # between them yet).
+    known_group = _find_via_known_alias_group(surface_form)
+    if known_group is not None:
+        canonical_name, variants = known_group
+        for variant in variants:
+            existing = await db.find_entity_by_alias(variant)
+            if existing is not None:
+                await db.add_entity_alias(existing["canonical_id"], surface_form)
+                return existing["canonical_id"]
+        # None of the group's variants are registered yet — register under
+        # the group's preferred canonical name (not the raw surface form),
+        # so future mentions of any variant resolve here immediately.
+        return await _register_new_entity(canonical_name, entity.type)
 
     hard_match = await db.find_entity_by_alias(surface_form)
     if hard_match is not None:

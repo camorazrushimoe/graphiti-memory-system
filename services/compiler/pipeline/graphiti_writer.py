@@ -22,6 +22,15 @@ Design notes
 - Non-blocking per spec (Layer 3 "Real-time processing model"): the caller
   (compiler main loop) awaits this, but the ingest HTTP endpoint itself is
   never blocked — only the async worker loop is, which is by design.
+- Idempotency (session 7 follow-up on the retry-duplication limitation
+  noted in sessions 3/6): `write_memory_item` now checks for an existing
+  Episodic node named `fact_id` before calling `add_episode`, and skips the
+  write (no-op) if one is already there. Combined with `fact_id` now being
+  a *deterministic* value derived from `(episode_id, item_index)` rather
+  than a fresh random UUID per attempt (see `services/compiler/main.py`),
+  a retried job that re-reaches the same item will resolve to the same
+  `fact_id` and this check turns the retry into a safe no-op instead of a
+  duplicate Episodic node.
 """
 
 from __future__ import annotations
@@ -49,11 +58,30 @@ async def write_memory_item(
 ) -> None:
     """Write a single MemoryItem to Graphiti as one episode.
 
+    Idempotent (session 7): if an Episodic node named `fact_id` already
+    exists (e.g. this exact write previously succeeded and the job is now
+    being retried because a *later* step/item failed), this is a no-op —
+    see module docstring "Idempotency" note. `fact_id` is expected to be a
+    deterministic dedup key (see `services/compiler/main.py`), not a fresh
+    random UUID per attempt, for this check to be effective across retries.
+
     Raises on failure — the caller decides whether a Graphiti write error
     should fail the whole compiler job (current behavior: yes, so retries
     per spec's "failed episodes are retried up to 3 times" apply here too).
     """
     graphiti = get_graphiti()
+
+    records, _, _ = await graphiti.driver.execute_query(
+        "MATCH (n:Episodic {name: $name}) RETURN n.uuid AS uuid LIMIT 1",
+        name=fact_id,
+    )
+    if records:
+        logger.info(
+            "graphiti: episode for fact %s already exists, skipping write (retry no-op)",
+            fact_id,
+        )
+        return
+
     await graphiti.add_episode(
         name=fact_id,
         episode_body=item.text,
